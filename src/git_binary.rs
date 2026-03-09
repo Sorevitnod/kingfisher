@@ -266,7 +266,10 @@ impl Git {
     ///
     /// Returns an error if the command fails or exits with a non-zero status.
     fn run_cmd(&self, mut cmd: Command) -> Result<(), GitError> {
-        debug!("{cmd:#?}");
+        // Log only the program and its arguments – deliberately exclude environment
+        // variables because they may contain credential tokens (KF_BITBUCKET_OAUTH_TOKEN,
+        // KF_GITHUB_TOKEN, etc.).
+        debug!(program = ?cmd.get_program(), args = ?cmd.get_args().collect::<Vec<_>>(), "running git command");
         let output: Output = cmd.output()?;
         if !output.status.success() {
             return Err(GitError::GitError {

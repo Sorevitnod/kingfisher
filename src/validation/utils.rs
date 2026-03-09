@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use reqwest::Url;
 use tokio::net::lookup_host;
 
@@ -106,11 +108,61 @@ pub fn find_closest_variable(
     best_before.or(best_overlap).or(best_after).map(|(_, value)| value)
 }
 
+/// Returns `true` for IP addresses that must not be contacted by the validator
+/// (loopback, private RFC-1918/4193, link-local, and similar).
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()          // 127.0.0.0/8
+                || v4.is_private()    // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local() // 169.254/16
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified() // 0.0.0.0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // Unique-local (fc00::/7) and link-local (fe80::/10)
+                || matches!(v6.segments()[0], 0xfc00..=0xfdff | 0xfe80..=0xfebf)
+        }
+    }
+}
+
 pub async fn check_url_resolvable(url: &Url) -> Result<(), Box<dyn std::error::Error>> {
+    // Block requests to non-HTTP(S) schemes to reduce attack surface.
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "Unsupported URL scheme '{}'; only http and https are allowed",
+            url.scheme()
+        )
+        .into());
+    }
+
     let host = url.host_str().ok_or("No host in URL")?;
+
+    // Reject bare IP literals that are private without even doing a DNS lookup.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(ip) {
+            return Err(format!("URL resolves to a private/internal IP address: {}", ip).into());
+        }
+    }
+
     let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
     let addr = format!("{}:{}", host, port);
-    lookup_host(addr).await?.next().ok_or_else(|| "Failed to resolve URL".into()).map(|_| ())
+    let resolved = lookup_host(addr).await?.next().ok_or("Failed to resolve URL")?;
+
+    // Check every resolved address – DNS rebinding can return a mix.
+    if is_private_ip(resolved.ip()) {
+        return Err(format!(
+            "URL '{}' resolves to a private/internal IP address: {}",
+            url,
+            resolved.ip()
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------

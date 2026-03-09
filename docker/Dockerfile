@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM alpine:latest
+FROM alpine:3.21
 
 RUN apk add --no-cache curl tar git
 
@@ -15,16 +15,26 @@ RUN set -eux; \
         arm64) SUFFIX="linux-arm64.tgz" ;; \
         *)     echo "unsupported arch ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    # download & unpack
-    LATEST_URL=$(curl -fsSL https://api.github.com/repos/mongodb/kingfisher/releases/latest \
-        | grep -Eo "https://[^\"]*${SUFFIX}"); \
+    # fetch release metadata once
+    RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/mongodb/kingfisher/releases/latest); \
+    LATEST_URL=$(printf '%s' "$RELEASE_JSON" | grep -Eo "https://[^\"]*${SUFFIX}\"" | head -1 | tr -d '"'); \
     if [ -z "$LATEST_URL" ]; then \
         echo "Failed to fetch the latest release URL for ${SUFFIX}" >&2; \
         exit 1; \
     fi; \
+    # derive the checksum file URL (same base name, .txt extension)
+    CHECKSUM_URL=$(printf '%s' "$RELEASE_JSON" | grep -Eo "https://[^\"]*CHECKSUM-[^\"]*\.txt\"" | head -1 | tr -d '"'); \
     curl -fsSL "$LATEST_URL" -o kingfisher.tgz; \
+    # verify checksum when the release provides one
+    if [ -n "$CHECKSUM_URL" ]; then \
+        curl -fsSL "$CHECKSUM_URL" -o CHECKSUM.txt; \
+        sha256sum -c CHECKSUM.txt --ignore-missing; \
+        rm -f CHECKSUM.txt; \
+    else \
+        echo "WARNING: no checksum file found for this release – skipping integrity check" >&2; \
+    fi; \
     tar -xzf kingfisher.tgz; \
-    rm -f kingfisher.tgz CHECKSUM-*.txt; \
+    rm -f kingfisher.tgz; \
     # locate the binary (pattern covers kingfisher-linux-x64 / kingfisher-linux-arm64)
     KF_PATH=$(find . -type f -name 'kingfisher*' -executable -print -quit); \
     if [ -z "$KF_PATH" ]; then echo "No executable kingfisher binary found" >&2; exit 1; fi; \

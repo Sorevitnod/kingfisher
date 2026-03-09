@@ -550,8 +550,11 @@ pub async fn run_direct_revocation(
         debug!("Rule selector '{}' matches {} rules, trying all", args.rule, num_matching_rules);
     }
 
+    // Use `tls_mode` (the canonical field) rather than the deprecated `ignore_certs`
+    // flag so that `--tls-mode=off` is respected correctly.
+    let disable_tls_verification = matches!(global_args.tls_mode, crate::cli::global::TlsMode::Off);
     let client = Client::builder()
-        .danger_accept_invalid_certs(global_args.ignore_certs)
+        .danger_accept_invalid_certs(disable_tls_verification)
         .timeout(Duration::from_secs(args.timeout))
         .user_agent(GLOBAL_USER_AGENT.as_str())
         .gzip(true)
