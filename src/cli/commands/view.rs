@@ -5,6 +5,9 @@ use std::{
     sync::Arc,
 };
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use rand::RngCore;
+
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
@@ -43,6 +46,15 @@ pub struct ViewArgs {
 #[derive(Clone)]
 struct AppState {
     report: Option<Vec<u8>>,
+    /// Per-process nonce used in Content-Security-Policy to allow only our own
+    /// inline scripts while blocking any injected ones.
+    csp_nonce: String,
+}
+
+fn generate_csp_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    BASE64.encode(bytes)
 }
 
 pub fn ensure_port_available(port: u16) -> Result<()> {
@@ -108,7 +120,7 @@ pub async fn run(args: ViewArgs) -> Result<()> {
         });
     }
 
-    let state = Arc::new(AppState { report });
+    let state = Arc::new(AppState { report, csp_nonce: generate_csp_nonce() });
 
     let app = Router::new()
         .route("/", get(serve_index))
@@ -121,28 +133,28 @@ pub async fn run(args: ViewArgs) -> Result<()> {
     Ok(())
 }
 
-async fn serve_index() -> Response {
-    serve_asset_at("index.html").unwrap_or_else(not_found)
+async fn serve_index(State(state): State<Arc<AppState>>) -> Response {
+    serve_asset_at("index.html", &state.csp_nonce).unwrap_or_else(not_found)
 }
 
-async fn serve_favicon() -> Response {
+async fn serve_favicon(State(state): State<Arc<AppState>>) -> Response {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
-        .map(apply_security_headers)
+        .map(|r| apply_security_headers(r, &state.csp_nonce))
         .unwrap_or_else(|_| internal_error())
 }
 
-async fn serve_asset(uri: Uri) -> Response {
+async fn serve_asset(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     if path.is_empty() {
-        return serve_index().await;
+        return serve_index(State(state)).await;
     }
     if !is_safe_path(path) {
         return not_found();
     }
 
-    serve_asset_at(path).unwrap_or_else(not_found)
+    serve_asset_at(path, &state.csp_nonce).unwrap_or_else(not_found)
 }
 
 async fn serve_report(State(state): State<Arc<AppState>>) -> Response {
@@ -151,14 +163,14 @@ async fn serve_report(State(state): State<Arc<AppState>>) -> Response {
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type_for("report.json"))
             .body(Body::from(report.clone()))
-            .map(apply_security_headers)
+            .map(|r| apply_security_headers(r, &state.csp_nonce))
             .unwrap_or_else(|_| internal_error());
     }
 
     not_found()
 }
 
-fn serve_asset_at(path: &str) -> Option<Response> {
+fn serve_asset_at(path: &str, csp_nonce: &str) -> Option<Response> {
     let file = VIEWER_ASSETS.get_file(path)?;
     let body = Body::from(file.contents().to_vec());
     let content_type = content_type_for(path);
@@ -167,7 +179,7 @@ fn serve_asset_at(path: &str) -> Option<Response> {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .body(body)
-        .map(apply_security_headers)
+        .map(|r| apply_security_headers(r, csp_nonce))
         .ok()
 }
 

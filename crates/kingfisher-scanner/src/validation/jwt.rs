@@ -12,6 +12,25 @@ use tokio::net::lookup_host;
 
 use super::http_validation::check_url_resolvable;
 
+/// Resolve `host` and return an error if any resolved address falls in a
+/// blocked (private / loopback / link-local) range.
+async fn assert_host_is_public(host: &str, port: u16) -> Result<()> {
+    let addrs: Vec<_> = lookup_host((host, port)).await?.collect();
+    if addrs.is_empty() {
+        return Err(anyhow!("could not resolve host: {}", host));
+    }
+    for addr in &addrs {
+        if is_blocked_ip(addr.ip()) {
+            return Err(anyhow!(
+                "host {} resolves to a private or link-local address ({})",
+                host,
+                addr.ip()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Global redirect-free client with strict TLS validation.
 static STRICT_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
@@ -163,6 +182,14 @@ pub async fn validate_jwt_with(
     };
 
     let issuer_url = normalize_issuer_url(&issuer)?;
+    let iss_host = issuer_url.host_str().unwrap_or_default().to_ascii_lowercase();
+
+    // Check the issuer host resolves to a public IP *before* making any request.
+    let iss_port = issuer_url.port().unwrap_or(443);
+    assert_host_is_public(&iss_host, iss_port)
+        .await
+        .map_err(|e| anyhow!("issuer host blocked: {e}"))?;
+
     let config_url =
         format!("{}/.well-known/openid-configuration", issuer_url.as_str().trim_end_matches('/'));
     let cfg_resp = client
@@ -188,7 +215,6 @@ pub async fn validate_jwt_with(
         return Ok((false, "jwks_uri must use https".to_string()));
     }
 
-    let iss_host = issuer_url.host_str().unwrap_or_default().to_ascii_lowercase();
     let jwks_host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     if jwks_host != iss_host {
         return Ok((
@@ -197,11 +223,12 @@ pub async fn validate_jwt_with(
         ));
     }
 
-    for addr in lookup_host((jwks_host.as_str(), 443)).await? {
-        if is_blocked_ip(addr.ip()) {
-            return Ok((false, "jwks_uri resolves to private or link-local IP".to_string()));
-        }
-    }
+    // Re-verify the JWKS host and use a single resolved address to avoid DNS rebinding:
+    // resolve once, block private IPs, then pass the resolved address to the HTTP client
+    // so no further DNS lookup can swap to an internal address.
+    assert_host_is_public(&jwks_host, 443)
+        .await
+        .map_err(|e| anyhow!("jwks_uri host blocked: {e}"))?;
 
     check_url_resolvable(&url).await.map_err(|e| anyhow!("jwks uri unresolvable: {e}"))?;
 
@@ -252,6 +279,13 @@ fn normalize_issuer_url(issuer: &str) -> Result<Url> {
 
     if let Ok(url) = Url::parse(trimmed) {
         if url.host_str().is_some() {
+            // Only HTTPS is allowed for issuer URLs to prevent MITM on discovery.
+            if url.scheme() != "https" {
+                return Err(anyhow!(
+                    "invalid iss: issuer URL must use https, got '{}'",
+                    url.scheme()
+                ));
+            }
             return Ok(url);
         }
     }
